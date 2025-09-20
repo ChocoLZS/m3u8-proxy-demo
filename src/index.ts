@@ -1,4 +1,7 @@
-import { routes } from './handlers.js';
+import { routes, Env } from './handlers.js';
+import { CacheStorage } from './durable-cache.js';
+
+export { CacheStorage };
 
 export default {
   async fetch(request, env) {
@@ -7,7 +10,7 @@ export default {
     for (const route of routes) {
       const match = pathname.match(route.pattern);
       if (match) {
-        return route.handler(request, ...match.slice(1));
+        return route.handler(request, ...match.slice(1), env);
       }
     }
     

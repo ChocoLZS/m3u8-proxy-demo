@@ -1,7 +1,11 @@
-import { cache, getOrFetch } from './cache.js';
+import { cache, getOrFetch, createCorsHeaders, DurableObjectCache, DurableCache } from './cache.js';
 import { getArgs, fetchM3u8Playlist, createM3u8Processor } from './parser.js';
 
-export async function handleApi(request: Request, id: string): Promise<Response> {
+export interface Env {
+  CACHE_STORAGE: DurableObjectNamespace;
+}
+
+export async function handleApi(request: Request, id: string, env?: Env): Promise<Response> {
   const url = new URL(request.url);
   const apiUrl = url.searchParams.get("url");
   
@@ -9,19 +13,38 @@ export async function handleApi(request: Request, id: string): Promise<Response>
     return new Response("Missing url parameter", { status: 400 });
   }
   
-  const cached = cache.get(id);
-  if (!cached || cached.origin_url !== apiUrl) {
-    cache.set(id, { origin_url: apiUrl });
+  // 使用 Durable Object 或回退到内存缓存
+  if (env?.CACHE_STORAGE) {
+    const cacheStub = env.CACHE_STORAGE.get(env.CACHE_STORAGE.idFromName("global"));
+    const durableCache = new DurableObjectCache(cacheStub);
+    
+    const cached = await durableCache.getContent(id);
+    if (!cached || cached.origin_url !== apiUrl) {
+      await durableCache.setContent(id, { origin_url: apiUrl });
+    }
+  } else {
+    const cached = cache.get(id);
+    if (!cached || cached.origin_url !== apiUrl) {
+      cache.set(id, { origin_url: apiUrl });
+    }
   }
   
-  // return new Response(JSON.stringify({ url: apiUrl }), { 
-  //   headers: { 'Content-Type': 'application/json' } 
-  // });
   return Response.redirect(`${url.origin}/api/${id}/index.m3u8`, 302);
 }
 
-export async function handleM3u8(request: Request, id: string): Promise<Response> {
-  const cached = cache.get(id);
+export async function handleM3u8(request: Request, id: string, env?: Env): Promise<Response> {
+  let cached = null;
+  let durableCache: DurableCache | null = null;
+  
+  // 使用 Durable Object 或回退到内存缓存
+  if (env?.CACHE_STORAGE) {
+    const cacheStub = env.CACHE_STORAGE.get(env.CACHE_STORAGE.idFromName("global"));
+    durableCache = new DurableObjectCache(cacheStub);
+    cached = await durableCache.getContent(id);
+  } else {
+    cached = cache.get(id);
+  }
+  
   if (!cached) {
     return new Response("ID not found. Please register first via /api/{id}?url=", { status: 404 });
   }
@@ -32,6 +55,13 @@ export async function handleM3u8(request: Request, id: string): Promise<Response
       if (result.playlistUrl && result.playlist) {
         cached.proxied_playlist_url = result.playlistUrl;
         cached.proxied_playlist = result.playlist;
+        
+        // 更新缓存
+        if (durableCache) {
+          await durableCache.setContent(id, cached);
+        } else {
+          cache.set(id, cached);
+        }
       } else {
         return new Response("Failed to fetch playlist", { status: 500 });
       }
@@ -40,13 +70,24 @@ export async function handleM3u8(request: Request, id: string): Promise<Response
     }
   }
   
-  return new Response(cached.proxied_playlist, {
-    headers: { "Content-Type": "application/x-mpegURL" }
-  });
+  const headers = createCorsHeaders();
+  headers.set("Content-Type", "application/x-mpegURL");
+  return new Response(cached.proxied_playlist, { headers });
 }
 
-export async function handleSegments(request: Request, id: string, segments: string): Promise<Response> {
-  const cached = cache.get(id);
+export async function handleSegments(request: Request, id: string, segments: string, env?: Env): Promise<Response> {
+  let cached = null;
+  let durableCache: DurableCache | null = null;
+  
+  // 使用 Durable Object 或回退到内存缓存
+  if (env?.CACHE_STORAGE) {
+    const cacheStub = env.CACHE_STORAGE.get(env.CACHE_STORAGE.idFromName("global"));
+    durableCache = new DurableObjectCache(cacheStub);
+    cached = await durableCache.getContent(id);
+  } else {
+    cached = cache.get(id);
+  }
+  
   if (!cached) {
     return new Response("ID not found", { status: 404 });
   }
@@ -89,11 +130,18 @@ export async function handleSegments(request: Request, id: string, segments: str
       segmentUrl.toString(),
       'auto', // 自动从内容中提取 TTL
       m3u8Processor,
-      { baseUrl, params }
+      { baseUrl, params },
+      durableCache || undefined
     );
     
     const responseHeaders = new Headers(segmentResponse.headers);
     responseHeaders.delete('Content-Length');
+    
+    // 添加 CORS 头
+    const corsHeaders = createCorsHeaders();
+    for (const [key, value] of corsHeaders.entries()) {
+      responseHeaders.set(key, value);
+    }
     
     return new Response(updatedText, {
       status: segmentResponse.status,
@@ -108,11 +156,20 @@ export async function handleSegments(request: Request, id: string, segments: str
 
 export interface Route {
   pattern: RegExp;
-  handler: (request: Request, ...args: string[]) => Promise<Response>;
+  handler: (request: Request, ...args: any[]) => Promise<Response>;
 }
 
 export const routes: Route[] = [
-  { pattern: /^\/api\/([^\/]+)$/, handler: handleApi },
-  { pattern: /^\/api\/([^\/]+)\/index\.m3u8$/, handler: handleM3u8 },
-  { pattern: /^\/api\/([^\/]+)\/(.+)$/, handler: handleSegments },
+  { 
+    pattern: /^\/api\/([^\/]+)$/, 
+    handler: (request: Request, id: string, env?: Env) => handleApi(request, id, env)
+  },
+  { 
+    pattern: /^\/api\/([^\/]+)\/index\.m3u8$/, 
+    handler: (request: Request, id: string, env?: Env) => handleM3u8(request, id, env)
+  },
+  { 
+    pattern: /^\/api\/([^\/]+)\/(.+)$/, 
+    handler: (request: Request, id: string, segments: string, env?: Env) => handleSegments(request, id, segments, env)
+  },
 ];
